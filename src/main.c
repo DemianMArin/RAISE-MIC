@@ -66,7 +66,7 @@ static void spam_notify(struct k_work *work);
 // Message Queue and Work Thread for Audio Buffer Transmission
 // ============================================================================
 
-// Message structure for passing buffer info from SAADC ISR to work thread
+// Message structure for passing buffer info from SAADC Interrupt Service Routine (ISR) to work thread
 struct buffer_msg {
     int16_t *buffer;    // Pointer to the filled buffer (4 bytes)
     size_t size;        // Number of samples in buffer (4 bytes)
@@ -130,6 +130,13 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
             int16_t current_value;
 
             for (int i = 0; i < p_event->data.done.size; i++) {
+                /* 
+                 * (int16_t *)(p_event->data.done.p_buffer) is an element of the 
+                 * SAADC_BUFFER_SIZE in one of the buffers (saadc_sample_buffer[0] 
+                 * or saadc_sample_buffer[1]). Every element is a 16bit (2 byte) 
+                 * number.
+                 */
+
                 current_value = ((int16_t *)(p_event->data.done.p_buffer))[i];
                 average += current_value;
                 if (current_value > max) {
@@ -141,8 +148,8 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
             }
             average = average / p_event->data.done.size;
 
-            LOG_INF("SAADC buffer filled: %d samples, AVG=%d, MIN=%d, MAX=%d",
-                    p_event->data.done.size, (int16_t)average, min, max);
+            //LOG_INF("SAADC buffer filled: %d samples, AVG=%d, MIN=%d, MAX=%d",
+            //        p_event->data.done.size, (int16_t)average, min, max);
 
             // Queue buffer for BLE transmission
             struct buffer_msg msg;
@@ -382,7 +389,7 @@ static void ble_send_work_handler(struct k_work *work)
             ble_tx_state.samples_sent = 0;
             ble_tx_state.is_sending = true;
 
-            LOG_INF("Starting to send buffer: %d samples", msg.size);
+            //LOG_INF("Starting to send buffer: %d samples", msg.size);
         } else {
             // Queue empty, nothing to send
             return;
