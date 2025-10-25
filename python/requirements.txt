@@ -1,0 +1,7 @@
+numpy
+sounddevice
+bleak
+PyQt5
+pyqtgraph
+qasync
+pydub

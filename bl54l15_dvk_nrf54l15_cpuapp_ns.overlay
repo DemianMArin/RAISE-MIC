@@ -1,0 +1,8 @@
+/*
+ * Device tree overlay for RAISE_mic_MAX application
+ * Board: bl54l15_dvk (nRF54L15)
+ */
+
+&adc {
+    status = "okay";
+};

@@ -4,3 +4,10 @@
 
 # build
 /build*/
+
+#Others
+.DS_Store
+.claude/
+MyMKD/
+claudeinstruction.md
+nul
