@@ -25,6 +25,7 @@ import csv
 from qasync import QEventLoop
 import wave
 import os
+from typing import List, Tuple, Optional
 
 # Optional MP3 support
 try:
@@ -37,7 +38,7 @@ DEVICE_NAME = "RAISE_mic"
 CTRL_UUID = "12345678-1234-5678-1234-56789abcdef1"
 DATA_UUID = "12345678-1234-5678-1234-56789abcdef2"
 
-AUDIO_FS = 8000  # Sample rate: 8 kHz (matches nRF54L15 configuration)
+AUDIO_FS = 16000 # Sample rate: 8 kHz (matches nRF54L15 configuration)
 
 class RAISEApp(QWidget):
     def __init__(self):
@@ -51,10 +52,9 @@ class RAISEApp(QWidget):
         self.streaming = False
 
         # Data stores
-        self.analog_data = []       # mV integers (all-time)
-        self.audio_buffer = []      # chunk buffer for playback
-        self.timestamps = []        # float epoch per packet
-        self.sequence_numbers = []  # for bitrate/loss calc
+        self.analog_data: List[Optional[int]] = []       # mV integers (all-time), None for dropped packets
+        self.audio_buffer: List[int] = []      # chunk buffer for playback
+        self.packet_metadata: List[Tuple[int, int]] = []   # List of (seq_num, sample_count) tuples for each packet
 
         # Metrics
         self.bitrate_values = []
@@ -64,7 +64,7 @@ class RAISEApp(QWidget):
         self.last_time = time.time()
 
         # Recording segment tracking
-        self.record_start_idx = None  # index into analog_data/timestamps where recording began
+        self.record_start_sample_idx: int = 0  # sample index in analog_data where recording began
 
         self.setup_ui()
         self.scan_devices()
@@ -155,10 +155,11 @@ class RAISEApp(QWidget):
     def toggle_recording(self):
         self.recording = not self.recording
         if self.recording:
-            # mark starting index (record only the segment after this point)
-            self.record_start_idx = len(self.analog_data)
+            # Calculate the current sample index by summing all samples from previous packets
+            sample_idx: int = sum(sample_count for seq_num, sample_count in self.packet_metadata)
+            self.record_start_sample_idx = sample_idx
             self.record_btn.setText("Stop Recording")
-            print("Recording: START")
+            print(f"Recording: START at sample index {sample_idx}")
         else:
             self.record_btn.setText("Start Recording")
             print("Recording: STOP")
@@ -225,13 +226,28 @@ class RAISEApp(QWidget):
             sample = int.from_bytes(data[offset:offset+2], byteorder='little', signed=True)
             samples.append(sample)
 
-        # Add all samples to data buffers
-        self.analog_data.extend(samples)
-        self.audio_buffer.extend(samples)
+        # Handle missing packets by filling gaps with placeholder metadata and None samples
+        if len(self.packet_metadata) > 0:
+            last_seq: int = self.packet_metadata[-1][0]
+            expected_seq: int = last_seq + 1
 
-        # One timestamp and sequence per packet (not per sample)
-        self.timestamps.append(time.time())
-        self.sequence_numbers.append(seq_num)
+            # Fill gaps for missing packets (assume 50 samples each)
+            while expected_seq < seq_num:
+                self.packet_metadata.append((expected_seq, 50))
+                # Fill analog_data with None values for missing samples
+                self.analog_data.extend([None] * 50)
+                expected_seq += 1
+
+        # Store current packet metadata (even if sample_count is 0)
+        self.packet_metadata.append((seq_num, sample_count))
+
+        # Add samples to data buffers (only if we actually received samples)
+        if sample_count > 0:
+            self.analog_data.extend(samples)
+            self.audio_buffer.extend(samples)
+        else:
+            # Packet arrived but empty - fill with None
+            self.analog_data.extend([None] * sample_count)
 
         # ========================================================================
         # METRICS DISABLED - TODO: Update for new packet format
@@ -296,52 +312,69 @@ class RAISEApp(QWidget):
             return False
 
     def save_recording(self):
-        # Determine slice to save (only the current recording window)
-        start = self.record_start_idx if self.record_start_idx is not None else 0
-        end = len(self.analog_data)
+        # Determine sample range to save (only the current recording window)
+        start_sample: int = self.record_start_sample_idx
+        end_sample: int = len(self.analog_data)
 
-        if end <= start:
+        if end_sample <= start_sample:
             print("Nothing to save.")
             return
 
-        seg_mv = np.array(self.analog_data[start:end], dtype=np.float32)
-        seg_ts = np.array(self.timestamps[start:end], dtype=np.float64)
+        # Build CSV data with seq_num, num_samples, timestep, sample
+        csv_rows: List[Tuple[int, int, int, Optional[int]]] = []
+
+        # Track cumulative timestep
+        timestep: int = 0
+
+        for seq_num, sample_count in self.packet_metadata:
+            # For each sample in this packet
+            for i in range(sample_count):
+                current_timestep: int = timestep + i
+
+                # Only include samples within the recording window
+                if start_sample <= current_timestep < end_sample:
+                    sample_value: Optional[int] = self.analog_data[current_timestep]
+                    csv_rows.append((seq_num, sample_count, current_timestep, sample_value))
+
+            # Update timestep for next packet
+            timestep += sample_count
 
         # File base name
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = f"recording_{now}"
 
-        # 1) Save CSV
+        # 1) Save CSV with new format
         csv_name = f"{base}.csv"
         with open(csv_name, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp", "Voltage (mV)"])
-            for t, v in zip(seg_ts, seg_mv):
-                writer.writerow([t, int(v)])
-        print(f"Saved: {csv_name}")
+            writer.writerow(["seq_num", "num_samples", "timestep", "sample"])
+            for row in csv_rows:
+                writer.writerow(row)
+        print(f"Saved: {csv_name} ({len(csv_rows)} samples)")
 
         # 2) Save WAV (PCM16) @ 16 kHz
         # Convert mV series into audio-ish int16:
         #   center, then scale to 90% of full scale to avoid clipping
-        centered = seg_mv - np.mean(seg_mv)
-        peak = np.max(np.abs(centered)) or 1.0
-        norm_float = 0.9 * centered / peak
-        pcm16 = np.clip((norm_float * 32767.0), -32768, 32767).astype(np.int16)
 
-        wav_name = f"{base}.wav"
-        self._write_wav_int16(pcm16, AUDIO_FS, wav_name)
-        print(f"Saved: {wav_name}")
+        # centered = seg_mv - np.mean(seg_mv)
+        # peak = np.max(np.abs(centered)) or 1.0
+        # norm_float = 0.9 * centered / peak
+        # pcm16 = np.clip((norm_float * 32767.0), -32768, 32767).astype(np.int16)
+        #
+        # wav_name = f"{base}.wav"
+        # self._write_wav_int16(pcm16, AUDIO_FS, wav_name)
+        # print(f"Saved: {wav_name}")
 
         # 3) Optional MP3
-        mp3_name = f"{base}.mp3"
-        did_mp3 = self._maybe_write_mp3(wav_name, mp3_name)
-        if did_mp3:
-            print(f"Saved: {mp3_name}")
-        else:
-            print("MP3 not saved (pydub/encoder not available).")
+
+        # mp3_name = f"{base}.mp3"
+        # did_mp3 = self._maybe_write_mp3(wav_name, mp3_name)
+        # if did_mp3:
+        #     print(f"Saved: {mp3_name}")
+        # else:
+        #     print("MP3 not saved (pydub/encoder not available).")
 
         # Reset start index for next session
-        self.record_start_idx = None
 
 app = QApplication(sys.argv)
 loop = QEventLoop(app)

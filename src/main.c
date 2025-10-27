@@ -29,7 +29,7 @@ LOG_MODULE_REGISTER(RAISE_mic, LOG_LEVEL_DBG);
 #define NRF_SAADC_INPUT_AIN4 NRF_PIN_PORT_TO_PIN_NUMBER(11U, 1)
 #define SAADC_INPUT_PIN NRF_SAADC_INPUT_AIN4
 static nrfx_saadc_channel_t channel = NRFX_SAADC_DEFAULT_CHANNEL_SE(SAADC_INPUT_PIN, 0);
-#define SAADC_SAMPLE_INTERVAL_US 125  // 1,000,000 / 125 = 8,000 Hz (8 kHz sample rate)
+#define SAADC_SAMPLE_INTERVAL_US 62.5 // 16k Hz sample rate
 #define SAADC_BUFFER_SIZE 2000  // 2000 samples = 250ms of audio at 8kHz, uses 8KB RAM total
 static int16_t saadc_sample_buffer[2][SAADC_BUFFER_SIZE];
 static uint32_t saadc_current_buffer = 0;
@@ -306,6 +306,7 @@ static void notify_cb(struct bt_conn *conn, void *user_data)
     }
 }
 
+// Legacy
 static ssize_t write_ctrl(struct bt_conn *conn, const struct bt_gatt_attr *attr,
                           const void *buf, uint16_t len, uint16_t offset, uint8_t flags)
 {
@@ -336,6 +337,7 @@ BT_GATT_SERVICE_DEFINE(stream_svc,
     BT_GATT_CCC(data_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
 );
 
+// Legacy
 static void spam_notify(struct k_work *work)
 {
     if (!streaming_enabled || !notify_enabled || !current_conn) {
