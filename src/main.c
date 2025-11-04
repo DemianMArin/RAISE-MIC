@@ -30,7 +30,7 @@ LOG_MODULE_REGISTER(RAISE_mic, LOG_LEVEL_DBG);
 #define SAADC_INPUT_PIN NRF_SAADC_INPUT_AIN4
 static nrfx_saadc_channel_t channel = NRFX_SAADC_DEFAULT_CHANNEL_SE(SAADC_INPUT_PIN, 0);
 #define SAADC_SAMPLE_INTERVAL_US 62.5 // 16k Hz sample rate
-#define SAADC_BUFFER_SIZE 2000  // 2000 samples = 250ms of audio at 8kHz, uses 8KB RAM total
+#define SAADC_BUFFER_SIZE 6000  // 2000 samples = 250ms of audio at 8kHz, uses 8KB RAM total
 static int16_t saadc_sample_buffer[2][SAADC_BUFFER_SIZE];
 static uint32_t saadc_current_buffer = 0;
 //Timer
@@ -73,7 +73,7 @@ struct buffer_msg {
 };
 
 // Message queue - holds up to 4 buffer messages (queue full = dropping audio data)
-#define BUFFER_QUEUE_SIZE 4
+#define BUFFER_QUEUE_SIZE 8
 K_MSGQ_DEFINE(buffer_msgq, sizeof(struct buffer_msg), BUFFER_QUEUE_SIZE, 4);
 
 // Work item for BLE transmission (runs in thread context, not ISR)
@@ -95,7 +95,7 @@ static struct {
 };
 
 // BLE packet configuration
-#define SAMPLES_PER_PACKET 50   // Send 50 samples per BLE packet (100 bytes + 6 byte header)
+#define SAMPLES_PER_PACKET 100   // Send 50 samples per BLE packet (100 bytes + 6 byte header)
 #define PACKET_HEADER_SIZE 6    // 4 bytes seq_num + 2 bytes sample_count
 
 // Forward declaration

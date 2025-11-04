@@ -150,8 +150,8 @@ def analyze_fft(csv_path: str, sample_rate: int = SAADC_SAMPLE_RATE):
 
 
 def process_csv_to_wav():
-    csv_file = "recording_20251026_200845.csv"
-    output_file = "recording_20251026_200845_generated.wav"
+    csv_file = f"{name}.csv"
+    output_file = f"{name}.wav"
 
     samples, none_count = analyze_csv(csv_file)
     create_audio(samples, output_file, sample_rate=SAADC_SAMPLE_RATE)
@@ -159,7 +159,7 @@ def process_csv_to_wav():
 
 def process_wav_to_csv():
     wav_to_csv("hola_base.wav", "hola_base.csv")
-    wav_to_csv("recording_20251026_200845_generated.wav", "recording_20251026_200845_generated.csv")
+    wav_to_csv(f"{name}.wav", f"{name}_generated.csv")
 
     # Read raw data
     samples1: List[int] = []
@@ -170,7 +170,7 @@ def process_wav_to_csv():
         for row in reader:
             samples1.append(int(row['sample']))
 
-    with open("recording_20251026_200845_generated.csv", 'r') as f:
+    with open(f"{name}_generated.csv", 'r') as f:
         reader = csv.DictReader(f)
         for row in reader:
             samples2.append(int(row['sample']))
@@ -180,7 +180,7 @@ def process_wav_to_csv():
 
     # Compute FFT
     freq1, mag1 = analyze_fft("hola_base.csv", sample_rate=SAADC_SAMPLE_RATE)
-    freq2, mag2 = analyze_fft("recording_20251026_200845_generated.csv", sample_rate=SAADC_SAMPLE_RATE)
+    freq2, mag2 = analyze_fft(f"{name}_generated.csv", sample_rate=SAADC_SAMPLE_RATE)
 
     # Create time axis (in seconds)
     time1 = np.arange(len(samples1_array)) / SAADC_SAMPLE_RATE* 1.0
@@ -199,7 +199,7 @@ def process_wav_to_csv():
 
     plt.subplot(3, 2, 2)
     plt.plot(time2, samples2_array)
-    plt.title("Raw Data: recording_20251026_200845_generated.wav")
+    plt.title(f"Raw Data: {name}_generated.wav")
     plt.xlabel("Time (s)")
     plt.ylabel("Amplitude")
     plt.grid(True)
@@ -215,7 +215,7 @@ def process_wav_to_csv():
 
     plt.subplot(3, 2, 4)
     plt.plot(freq2, mag2)
-    plt.title("FFT: recording_20251026_200845_generated.wav")
+    plt.title(f"FFT: {name}_generated.wav")
     plt.xlabel("Frequency (Hz)")
     plt.ylabel("Magnitude (dB)")
     plt.grid(True)
@@ -232,7 +232,7 @@ def process_wav_to_csv():
 
     plt.subplot(3, 2, 6)
     plt.specgram(samples2_array, Fs=SAADC_SAMPLE_RATE, NFFT=1024, noverlap=512, cmap='viridis')
-    plt.title("Spectrogram: recording_20251026_200845_generated.wav")
+    plt.title(f"Spectrogram: {name}_generated.wav")
     plt.xlabel("Time (s)")
     plt.ylabel("Frequency (Hz)")
     plt.ylim(0, 8000)
@@ -245,6 +245,7 @@ def process_wav_to_csv():
 
 
 if __name__ == "__main__":
+    name = "recording"
 
     if len(sys.argv) < 2:
         print("Usage: python audio_processing.py [all|2csv|2wav]")

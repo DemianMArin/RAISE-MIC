@@ -341,7 +341,8 @@ class RAISEApp(QWidget):
 
         # File base name
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = f"recording_{now}"
+        # base = f"recording_{now}"
+        base = f"recording"
 
         # 1) Save CSV with new format
         csv_name = f"{base}.csv"
