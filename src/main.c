@@ -4,7 +4,7 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(RAISE_mic, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(NEW_NAME, LOG_LEVEL_DBG);
 
 
 #include <zephyr/device.h>
@@ -30,7 +30,7 @@ LOG_MODULE_REGISTER(RAISE_mic, LOG_LEVEL_DBG);
 #define SAADC_INPUT_PIN NRF_SAADC_INPUT_AIN4
 static nrfx_saadc_channel_t channel = NRFX_SAADC_DEFAULT_CHANNEL_SE(SAADC_INPUT_PIN, 0);
 #define SAADC_SAMPLE_INTERVAL_US 62.5 // 16k Hz sample rate
-#define SAADC_BUFFER_SIZE 6000  // 2000 samples = 250ms of audio at 8kHz, uses 8KB RAM total
+#define SAADC_BUFFER_SIZE 2000// 2000 samples = 250ms of audio at 8kHz, uses 8KB RAM total
 static int16_t saadc_sample_buffer[2][SAADC_BUFFER_SIZE];
 static uint32_t saadc_current_buffer = 0;
 //Timer
@@ -42,8 +42,8 @@ const nrfx_timer_t timer_instance = NRFX_TIMER_INSTANCE(TIMER_INSTANCE_NUMBER);
 #define DEVICE_NAME_LEN (sizeof(CONFIG_BT_DEVICE_NAME) - 1)
 
 static bool streaming_enabled = true;
-static int16_t sample;
-static uint8_t seq_num = 0;
+//static int16_t sample;
+//static uint8_t seq_num = 0;
 
 /* UUIDs */
 #define BT_UUID_STREAM_SERVICE_VAL BT_UUID_128_ENCODE(0x12345678,0x1234,0x5678,0x1234,0x56789abcdef0)
@@ -83,20 +83,22 @@ static struct k_work ble_send_work;
 static struct {
     int16_t *current_buffer;    // Buffer currently being sent
     size_t total_samples;       // Total samples in current buffer
+    uint16_t packet_index;       // index of packet withing buffer of size SAADC_BUFFER_SIZE
     size_t samples_sent;        // How many samples already sent
     bool is_sending;            // True if actively sending a buffer
     uint32_t seq_num;           // Packet sequence number
 } ble_tx_state = {
     .current_buffer = NULL,
     .total_samples = 0,
+    .packet_index = 0,
     .samples_sent = 0,
     .is_sending = false,
     .seq_num = 0
 };
 
 // BLE packet configuration
-#define SAMPLES_PER_PACKET 100   // Send 50 samples per BLE packet (100 bytes + 6 byte header)
-#define PACKET_HEADER_SIZE 6    // 4 bytes seq_num + 2 bytes sample_count
+#define SAMPLES_PER_PACKET 118// Send SAMPLES_PER_PACKET samples per BLE packet (100 bytes + byte header)
+#define PACKET_HEADER_SIZE 8    // 4 bytes seq_num + 2 bytes sample_count + 2 packet index
 
 // Forward declaration
 static void ble_send_work_handler(struct k_work *work);
@@ -123,30 +125,32 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
             break;
 
         case NRFX_SAADC_EVT_DONE:
+            ble_tx_state.seq_num++; // New sequence of buffer size SAADC_BUFFER_SIZE full =)
+
             // Buffer has been filled with samples - calculate stats for debugging
-            int64_t average = 0;
-            int16_t max = INT16_MIN;
-            int16_t min = INT16_MAX;
-            int16_t current_value;
+            //int64_t average = 0;
+            //int16_t max = INT16_MIN;
+            //int16_t min = INT16_MAX;
+            //int16_t current_value;
 
-            for (int i = 0; i < p_event->data.done.size; i++) {
-                /* 
-                 * (int16_t *)(p_event->data.done.p_buffer) is an element of the 
-                 * SAADC_BUFFER_SIZE in one of the buffers (saadc_sample_buffer[0] 
-                 * or saadc_sample_buffer[1]). Every element is a 16bit (2 byte) 
-                 * number.
-                 */
+            //for (int i = 0; i < p_event->data.done.size; i++) {
+            //    /* 
+            //     * (int16_t *)(p_event->data.done.p_buffer) is an element of the 
+            //     * SAADC_BUFFER_SIZE in one of the buffers (saadc_sample_buffer[0] 
+            //     * or saadc_sample_buffer[1]). Every element is a 16bit (2 byte) 
+            //     * number.
+            //     */
 
-                current_value = ((int16_t *)(p_event->data.done.p_buffer))[i];
-                average += current_value;
-                if (current_value > max) {
-                    max = current_value;
-                }
-                if (current_value < min) {
-                    min = current_value;
-                }
-            }
-            average = average / p_event->data.done.size;
+            //    current_value = ((int16_t *)(p_event->data.done.p_buffer))[i];
+            //    average += current_value;
+            //    if (current_value > max) {
+            //        max = current_value;
+            //    }
+            //    if (current_value < min) {
+            //        min = current_value;
+            //    }
+            //}
+            //average = average / p_event->data.done.size;
 
             //LOG_INF("SAADC buffer filled: %d samples, AVG=%d, MIN=%d, MAX=%d",
             //        p_event->data.done.size, (int16_t)average, min, max);
@@ -156,7 +160,7 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
             msg.buffer = (int16_t *)p_event->data.done.p_buffer;
             msg.size = p_event->data.done.size;
 
-            // Try to queue the buffer (non-blocking - we're in ISR!)
+            // Try to queue the buffer (non-blocking - we're in Interrupt Service Routine (ISR)!)
             if (k_msgq_put(&buffer_msgq, &msg, K_NO_WAIT) != 0) {
                 // Queue full! Audio data will be dropped
                 LOG_WRN("Buffer queue full! Dropping %d samples", msg.size);
@@ -338,41 +342,41 @@ BT_GATT_SERVICE_DEFINE(stream_svc,
 );
 
 // Legacy
-static void spam_notify(struct k_work *work)
-{
-    if (!streaming_enabled || !notify_enabled || !current_conn) {
-      printk("Conditions not met\n\r");
-      return;
-    }
-
-    //nrfx_err_t err = nrfx_saadc_mode_trigger();
-    //if (err != NRFX_SUCCESS) {
-    //    k_work_schedule(&spam_work, K_MSEC(1));
-    //    printk("ADC not working");
-    //    return;
-    //}
-
-    /* int battery_voltage_mv = ((900 * 4) * sample) / (1 << 12);  */
-    int battery_voltage_mv = 4096;
-
-    uint8_t payload[5];
-    payload[0] = seq_num++;
-    sys_put_le32(battery_voltage_mv, &payload[1]);
-
-    struct bt_gatt_notify_params params = {
-        .attr = &stream_svc.attrs[3],
-        .data = payload,
-        .len = sizeof(payload),
-        .func = notify_cb,
-        .user_data = NULL,
-    };
-
-    uint8_t err = bt_gatt_notify_cb(current_conn, &params);
-    if (err != 0) {
-        // back off if failed
-        k_work_schedule(&spam_work, K_MSEC(1));
-    }
-}
+//static void spam_notify(struct k_work *work)
+//{
+//    if (!streaming_enabled || !notify_enabled || !current_conn) {
+//      printk("Conditions not met\n\r");
+//      return;
+//    }
+//
+//    //nrfx_err_t err = nrfx_saadc_mode_trigger();
+//    //if (err != NRFX_SUCCESS) {
+//    //    k_work_schedule(&spam_work, K_MSEC(1));
+//    //    printk("ADC not working");
+//    //    return;
+//    //}
+//
+//    /* int battery_voltage_mv = ((900 * 4) * sample) / (1 << 12);  */
+//    int battery_voltage_mv = 4096;
+//
+//    uint8_t payload[5];
+//    payload[0] = seq_num++;
+//    sys_put_le32(battery_voltage_mv, &payload[1]);
+//
+//    struct bt_gatt_notify_params params = {
+//        .attr = &stream_svc.attrs[3],
+//        .data = payload,
+//        .len = sizeof(payload),
+//        .func = notify_cb,
+//        .user_data = NULL,
+//    };
+//
+//    uint8_t err = bt_gatt_notify_cb(current_conn, &params);
+//    if (err != 0) {
+//        // back off if failed
+//        k_work_schedule(&spam_work, K_MSEC(1));
+//    }
+//}
 
 /* BLE Send Work Handler - sends audio buffer in chunks */
 static void ble_send_work_handler(struct k_work *work)
@@ -388,6 +392,7 @@ static void ble_send_work_handler(struct k_work *work)
             // Got a buffer! Start sending it
             ble_tx_state.current_buffer = msg.buffer;
             ble_tx_state.total_samples = msg.size;
+            ble_tx_state.packet_index = 0;
             ble_tx_state.samples_sent = 0;
             ble_tx_state.is_sending = true;
 
@@ -414,20 +419,23 @@ static void ble_send_work_handler(struct k_work *work)
      * Build BLE Packet for Audio Transmission
      * =========================================
      * Packet Format (sent over BLE to receiver):
-     *   Byte 0-3:  seq_num       (uint32_t, little-endian) - Packet sequence number
+     *   Byte 0-3:  seq_num       (uint32_t, little-endian) - Buffer sequence number
      *   Byte 4-5:  sample_count  (uint16_t, little-endian) - Number of samples in this packet
-     *   Byte 6+:   samples       (int16_t array, little-endian) - Audio sample data
+     *   Byte 6-7:  packet_index  (uint16_t, little-endian) - Index of packet within SAADC_BUFFER_SIZE buffer
+     *   Byte 8+:   samples       (int16_t array, little-endian) - Audio sample data
      *
      * Example with 50 samples:
-     *   packet[0..3]   = 0x2A000000  (seq_num = 42)
+     *   packet[0..3]   = 0x2A000000  (seq_num = 42, meaning 42nd buffer)
      *   packet[4..5]   = 0x3200      (sample_count = 50)
-     *   packet[6..7]   = 0xD5FF      (sample[0] = -43 as int16_le)
-     *   packet[8..9]   = 0xE2FF      (sample[1] = -30 as int16_le)
+     *   packet[6..7]   = 0x0500      (packet_index = 5, meaning 5th packet in this buffer)
+     *   packet[8..9]   = 0xD5FF      (sample[0] = -43 as int16_le)
+     *   packet[10..11] = 0xE2FF      (sample[1] = -30 as int16_le)
      *   ...
-     *   packet[104..105] = sample[49]
-     *   Total size: 6 + (50 * 2) = 106 bytes
+     *   packet[106..107] = sample[49]
+     *   Total size: 8 + (50 * 2) = 108 bytes
      */
     uint8_t packet[PACKET_HEADER_SIZE + SAMPLES_PER_PACKET * 2];
+    size_t len = sizeof(packet);
 
     // Header: sequence number (4 bytes, little-endian)
     sys_put_le32(ble_tx_state.seq_num, &packet[0]);
@@ -435,8 +443,11 @@ static void ble_send_work_handler(struct k_work *work)
     // Header: sample count (2 bytes, little-endian)
     sys_put_le16(chunk_size, &packet[4]);
 
+    // Header: packet index (2 bytes, little-endian)
+    sys_put_le16(ble_tx_state.packet_index, &packet[6]);
+
     // Payload: audio samples (chunk_size * 2 bytes, int16 little-endian)
-    memcpy(&packet[6],
+    memcpy(&packet[8],
            &ble_tx_state.current_buffer[ble_tx_state.samples_sent],
            chunk_size * sizeof(int16_t));
 
@@ -463,7 +474,8 @@ static void ble_send_work_handler(struct k_work *work)
 
     // Update progress
     ble_tx_state.samples_sent += chunk_size;
-    ble_tx_state.seq_num++;
+    ble_tx_state.packet_index++;
+    // ble_tx_state.seq_num++;
 
     // Check if buffer complete
     if (ble_tx_state.samples_sent >= ble_tx_state.total_samples) {
@@ -513,6 +525,7 @@ static void configure_bluetooth(void)
     }
     LOG_INF("Bluetooth enabled");
 
+    settings_delete("bt");
     // Load settings if enabled
     if (IS_ENABLED(CONFIG_SETTINGS)) {
         settings_load();

@@ -34,17 +34,25 @@ try:
 except Exception:
     _PydubAvailable = False
 
-DEVICE_NAME = "RAISE_mic"
+DEVICE_NAME = "NEW_NAME"
 CTRL_UUID = "12345678-1234-5678-1234-56789abcdef1"
 DATA_UUID = "12345678-1234-5678-1234-56789abcdef2"
 
-AUDIO_FS = 16000 # Sample rate: 8 kHz (matches nRF54L15 configuration)
+AUDIO_FS = 16000 # 16kHz (matches nRF54L15 configuration)
+PACKET_HEADER_SIZE = 8
+SAMPLES_PER_PACKET = 118
+SAADC_BUFFER_SIZE = 2000
+
+# Voltage plot configuration
+VOLTAGE_PLOT_WINDOW = 1000  # Number of samples to display on x-axis
+VOLTAGE_PLOT_Y_MIN = -400# Minimum y-axis value (ADC range: -2048 to 2047)
+VOLTAGE_PLOT_Y_MAX = 400# Maximum y-axis value
 
 class RAISEApp(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("RAISE Microphone Testbench")
-        self.resize(1000, 800)
+        self.resize(3000, 2000)
         self.client = None
         self.device = None
         self.connected = False
@@ -54,7 +62,7 @@ class RAISEApp(QWidget):
         # Data stores
         self.analog_data: List[Optional[int]] = []       # mV integers (all-time), None for dropped packets
         self.audio_buffer: List[int] = []      # chunk buffer for playback
-        self.packet_metadata: List[Tuple[int, int]] = []   # List of (seq_num, sample_count) tuples for each packet
+        self.packet_metadata: List[Tuple[int, int, int]] = []   # List of (seq_num, sample_count, packet_index) tuples for each packet
 
         # Metrics
         self.bitrate_values = []
@@ -102,6 +110,10 @@ class RAISEApp(QWidget):
             "snr": pg.PlotWidget(title="Normalized SNR (dB)"),
             "loss": pg.PlotWidget(title="Packet Loss (%)")
         }
+
+        # Configure voltage plot with fixed y-axis range
+        self.graphs["voltage"].setYRange(VOLTAGE_PLOT_Y_MIN, VOLTAGE_PLOT_Y_MAX, padding=0)
+
         self.graph_lines = {}
         for key, graph in self.graphs.items():
             self.graph_lines[key] = graph.plot(pen='g')
@@ -156,7 +168,7 @@ class RAISEApp(QWidget):
         self.recording = not self.recording
         if self.recording:
             # Calculate the current sample index by summing all samples from previous packets
-            sample_idx: int = sum(sample_count for seq_num, sample_count in self.packet_metadata)
+            sample_idx: int = sum(sample_count for seq_num, sample_count, packet_index in self.packet_metadata)
             self.record_start_sample_idx = sample_idx
             self.record_btn.setText("Stop Recording")
             print(f"Recording: START at sample index {sample_idx}")
@@ -167,8 +179,17 @@ class RAISEApp(QWidget):
 
     def update_plots(self):
         if self.analog_data:
-            self.graph_lines["voltage"].setData(self.analog_data[-100:])
-            self.labels["voltage"].setText(f"Voltage: {self.analog_data[-1]} mV")
+            # Old code (fixed 100 samples):
+            #self.graph_lines["voltage"].setData(self.analog_data[-100:])
+            #self.labels["voltage"].setText(f"Voltage: {self.analog_data[-1]} mV")
+
+            # New code (configurable window, handle None values):
+            voltage_display = [v if v is not None else 0 for v in self.analog_data[-VOLTAGE_PLOT_WINDOW:]]
+            self.graph_lines["voltage"].setData(voltage_display)
+
+            # Show last non-None value in label
+            last_value = self.analog_data[-1] if self.analog_data[-1] is not None else 0
+            self.labels["voltage"].setText(f"Voltage: {last_value} mV")
 
         if self.bitrate_values:
             self.graph_lines["bitrate"].setData(self.bitrate_values[-100:])
@@ -182,39 +203,38 @@ class RAISEApp(QWidget):
             self.graph_lines["loss"].setData(self.packet_loss_values[-100:])
             self.labels["loss"].setText(f"Packet Loss: {self.packet_loss_values[-1]:.1f}%")
 
-    def handle_notify(self, handle, data):
+    def handle_notify(self, handle, data): 
         """
-        Parse BLE notification packets from nRF54L15
-
-        Packet Format (from nRF54L15 C code):
-        =====================================
-        Byte 0-3:  seq_num       (uint32_t, little-endian) - Packet sequence number
-        Byte 4-5:  sample_count  (uint16_t, little-endian) - Number of samples in packet
-        Byte 6+:   samples       (int16_t array, little-endian) - Audio sample data
-
-        Example packet with 50 samples (106 bytes total):
-            data[0:4]   = b'\x2A\x00\x00\x00'  -> seq_num = 42
-            data[4:6]   = b'\x32\x00'          -> sample_count = 50
-            data[6:8]   = b'\xD5\xFF'          -> samples[0] = -43 (int16)
-            data[8:10]  = b'\xE2\xFF'          -> samples[1] = -30 (int16)
-            ...
-            data[104:106] = samples[49]
-
-        Typical packet: 6 bytes header + 50 samples * 2 bytes = 106 bytes
-        Sample rate: 8000 Hz
-        Buffer size: 2000 samples per buffer (sent as 40 packets)
-        """
+        Build BLE Packet for Audio Transmission
+        =========================================
+        Packet Format (sent over BLE to receiver):
+          Byte 0-3:  seq_num       (uint32_t, little-endian) - Buffer sequence number
+          Byte 4-5:  sample_count  (uint16_t, little-endian) - Number of samples in this packet
+          Byte 6-7:  packet_index  (uint16_t, little-endian) - Index of packet within SAADC_BUFFER_SIZE buffer
+          Byte 8+:   samples       (int16_t array, little-endian) - Audio sample data
+        
+        Example with 50 samples:
+          packet[0..3]   = 0x2A000000  (seq_num = 42, meaning 42nd buffer)
+          packet[4..5]   = 0x3200      (sample_count = 50)
+          packet[6..7]   = 0x0500      (packet_index = 5, meaning 5th packet in this buffer)
+          packet[8..9]   = 0xD5FF      (sample[0] = -43 as int16_le)
+          packet[10..11] = 0xE2FF      (sample[1] = -30 as int16_le)
+          ...
+          packet[106..107] = sample[49]
+          Total size: 8 + (50 * 2) = 108 bytes
+        """ 
         # Validate minimum packet size
-        if len(data) < 6:
-            print("Packet too small:", len(data), "bytes (expected >= 6)")
+        if len(data) < PACKET_HEADER_SIZE:
+            print(f"Packet too small: {len(data)} bytes (expected >= {PACKET_HEADER_SIZE})")
             return
 
         # Parse packet header
         seq_num = int.from_bytes(data[0:4], byteorder='little', signed=False)  # uint32
         sample_count = int.from_bytes(data[4:6], byteorder='little', signed=False)  # uint16
+        packet_index = int.from_bytes(data[6:8], byteorder='little', signed=False)  # uint16
 
         # Validate packet size matches declared sample count
-        expected_size = 6 + sample_count * 2
+        expected_size = PACKET_HEADER_SIZE + sample_count * 2
         if len(data) != expected_size:
             print(f"Packet size mismatch: expected {expected_size}, got {len(data)}")
             return
@@ -222,26 +242,59 @@ class RAISEApp(QWidget):
         # Extract audio samples (int16 array, little-endian, signed)
         samples = []
         for i in range(sample_count):
-            offset = 6 + i * 2
+            offset = PACKET_HEADER_SIZE + i * 2
             sample = int.from_bytes(data[offset:offset+2], byteorder='little', signed=True)
             samples.append(sample)
 
-        # Handle missing packets by filling gaps with placeholder metadata and None samples
+        # ========================================================================
+        # Gap Filling Logic - Handle Missing Buffers and Packets
+        # ========================================================================
+        # Two levels of packet loss detection:
+        # 1. Buffer-level: Missing seq_num (entire SAADC buffers dropped)
+        # 2. Packet-level: Missing packet_index within a seq_num (individual BLE packets dropped)
+
+        packets_per_buffer = SAADC_BUFFER_SIZE // SAMPLES_PER_PACKET  # 60 packets per buffer
+
         if len(self.packet_metadata) > 0:
-            last_seq: int = self.packet_metadata[-1][0]
-            expected_seq: int = last_seq + 1
+            last_seq, last_sample_count, last_packet_index = self.packet_metadata[-1]
 
-            # Fill gaps for missing packets (assume 50 samples each)
-            while expected_seq < seq_num:
-                self.packet_metadata.append((expected_seq, 50))
-                # Fill analog_data with None values for missing samples
-                self.analog_data.extend([None] * 50)
-                expected_seq += 1
+            # Case 1: Same buffer (seq_num unchanged) - check for packet_index gaps
+            if seq_num == last_seq:
+                # Fill missing packet_index within this buffer
+                for missing_idx in range(last_packet_index + 1, packet_index):
+                    self.packet_metadata.append((seq_num, SAMPLES_PER_PACKET, missing_idx))
+                    self.analog_data.extend([None] * SAMPLES_PER_PACKET)
+                    print(f"Gap filled: seq={seq_num}, packet_index={missing_idx} (missing packet within buffer)")
 
-        # Store current packet metadata (even if sample_count is 0)
-        self.packet_metadata.append((seq_num, sample_count))
+            # Case 2: New buffer (seq_num jumped) - fill missing buffers and packets
+            elif seq_num > last_seq:
+                # Step 2a: Fill remaining packets in the previous buffer (if incomplete)
+                for missing_idx in range(last_packet_index + 1, packets_per_buffer):
+                    self.packet_metadata.append((last_seq, SAMPLES_PER_PACKET, missing_idx))
+                    self.analog_data.extend([None] * SAMPLES_PER_PACKET)
+                    print(f"Gap filled: seq={last_seq}, packet_index={missing_idx} (completing previous buffer)")
 
-        # Add samples to data buffers (only if we actually received samples)
+                # Step 2b: Fill completely missing buffers (seq_num gaps)
+                for missing_seq in range(last_seq + 1, seq_num):
+                    for missing_idx in range(packets_per_buffer):
+                        self.packet_metadata.append((missing_seq, SAMPLES_PER_PACKET, missing_idx))
+                        self.analog_data.extend([None] * SAMPLES_PER_PACKET)
+                    print(f"Gap filled: seq={missing_seq} (entire buffer missing, {packets_per_buffer} packets)")
+
+                # Step 2c: Fill missing packets at start of current buffer
+                for missing_idx in range(0, packet_index):
+                    self.packet_metadata.append((seq_num, SAMPLES_PER_PACKET, missing_idx))
+                    self.analog_data.extend([None] * SAMPLES_PER_PACKET)
+                    print(f"Gap filled: seq={seq_num}, packet_index={missing_idx} (missing packet at buffer start)")
+
+            # Case 3: seq_num went backwards (shouldn't happen, but handle it)
+            else:
+                print(f"WARNING: seq_num went backwards! last={last_seq}, current={seq_num}")
+
+        # Store current packet metadata
+        self.packet_metadata.append((seq_num, sample_count, packet_index))
+
+        # Add samples to data buffers
         if sample_count > 0:
             self.analog_data.extend(samples)
             self.audio_buffer.extend(samples)
@@ -320,13 +373,13 @@ class RAISEApp(QWidget):
             print("Nothing to save.")
             return
 
-        # Build CSV data with seq_num, num_samples, timestep, sample
-        csv_rows: List[Tuple[int, int, int, Optional[int]]] = []
+        # Build CSV data with seq_num, packet_index, num_samples, timestep, sample
+        csv_rows: List[Tuple[int, int, int, int, Optional[int]]] = []
 
         # Track cumulative timestep
         timestep: int = 0
 
-        for seq_num, sample_count in self.packet_metadata:
+        for seq_num, sample_count, packet_index in self.packet_metadata:
             # For each sample in this packet
             for i in range(sample_count):
                 current_timestep: int = timestep + i
@@ -334,7 +387,7 @@ class RAISEApp(QWidget):
                 # Only include samples within the recording window
                 if start_sample <= current_timestep < end_sample:
                     sample_value: Optional[int] = self.analog_data[current_timestep]
-                    csv_rows.append((seq_num, sample_count, current_timestep, sample_value))
+                    csv_rows.append((seq_num, packet_index, sample_count, current_timestep, sample_value))
 
             # Update timestep for next packet
             timestep += sample_count
@@ -348,7 +401,7 @@ class RAISEApp(QWidget):
         csv_name = f"{base}.csv"
         with open(csv_name, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["seq_num", "num_samples", "timestep", "sample"])
+            writer.writerow(["seq_num", "packet_index", "num_samples", "timestep", "sample"])
             for row in csv_rows:
                 writer.writerow(row)
         print(f"Saved: {csv_name} ({len(csv_rows)} samples)")

@@ -11,8 +11,19 @@ import sys
 SAADC_SAMPLE_RATE: int = 16000  # Hz
 
 
-def analyze_csv(csv_path: str) -> Tuple[np.ndarray, int]:
-    samples: List[int] = []
+def analyze_csv(csv_path: str) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Analyze CSV and return two versions of the data:
+    1. Continuous array (None values skipped) - for audio reconstruction
+    2. Full array (None values as 0) - for analysis/visualization
+
+    Returns:
+        samples_continuous: Array with None values removed (time-compressed audio)
+        samples_with_gaps: Array with None values replaced by 0 (for packet loss analysis)
+        none_count: Number of dropped samples
+    """
+    samples_continuous: List[int] = []  # Skip None values
+    samples_with_gaps: List[float] = []  # Keep None values as 0
     none_count: int = 0
 
     print(f"Reading CSV: {csv_path}")
@@ -21,34 +32,43 @@ def analyze_csv(csv_path: str) -> Tuple[np.ndarray, int]:
         for row in reader:
             sample_str = row['sample']
 
-            # Handle None values (dropped packets) - treat as 0
-            if sample_str and sample_str != 'None': # Check if "None" or empty
-                samples.append(int(sample_str))
+            # Handle None values (dropped packets)
+            if sample_str and sample_str != 'None':
+                sample_value = int(sample_str)
+                samples_continuous.append(sample_value)
+                samples_with_gaps.append(sample_value)
             else:
-                samples.append(0)
+                # Skip for continuous array, add 0 for gap array
+                samples_with_gaps.append(0.0)
                 none_count += 1
 
-    # Convert to numpy array for analysis
-    samples_array = np.array(samples, dtype=np.float32)
+    # Convert to numpy arrays
+    samples_continuous_array = np.array(samples_continuous, dtype=np.float32)
+    samples_with_gaps_array = np.array(samples_with_gaps, dtype=np.float32)
 
-    # Calculate statistics
-    total_samples = len(samples)
-    min_value = np.min(samples_array)
-    max_value = np.max(samples_array)
+    # Calculate statistics (on continuous data for meaningful values)
+    total_samples_received = len(samples_continuous)
+    total_samples_with_gaps = len(samples_with_gaps)
 
-    # Vrms = sqrt(mean(voltage^2))
-    vrms = np.sqrt(np.mean(samples_array ** 2))
+    if total_samples_received > 0:
+        min_value = np.min(samples_continuous_array)
+        max_value = np.max(samples_continuous_array)
+        vrms = np.sqrt(np.mean(samples_continuous_array ** 2))
+    else:
+        min_value = max_value = vrms = 0.0
 
     # Print analysis
     print(f"\n=== CSV Analysis ===")
-    print(f"Total samples: {total_samples}")
-    print(f"None samples: {none_count} ({100.0 * none_count / total_samples:.2f}%)")
+    print(f"Total samples (with gaps): {total_samples_with_gaps}")
+    print(f"Total samples (received): {total_samples_received}")
+    print(f"Dropped samples: {none_count} ({100.0 * none_count / total_samples_with_gaps:.2f}%)")
     print(f"Min value: {min_value:.0f}")
     print(f"Max value: {max_value:.0f}")
     print(f"Vrms: {vrms:.2f}")
-    print(f"Duration: {total_samples / SAADC_SAMPLE_RATE:.2f} seconds")
+    print(f"Duration (with gaps): {total_samples_with_gaps / SAADC_SAMPLE_RATE:.2f} seconds")
+    print(f"Duration (continuous): {total_samples_received / SAADC_SAMPLE_RATE:.2f} seconds")
 
-    return samples_array, none_count
+    return samples_continuous_array, samples_with_gaps_array, none_count
 
 
 def create_audio(samples: np.ndarray, output_wav_path: str, sample_rate: int = SAADC_SAMPLE_RATE):
@@ -153,8 +173,11 @@ def process_csv_to_wav():
     csv_file = f"{name}.csv"
     output_file = f"{name}.wav"
 
-    samples, none_count = analyze_csv(csv_file)
-    create_audio(samples, output_file, sample_rate=SAADC_SAMPLE_RATE)
+    # Get continuous samples (no gaps) for audio reconstruction
+    samples_continuous, samples_with_gaps, none_count = analyze_csv(csv_file)
+
+    # Use continuous samples for audio (time-compressed but intelligible)
+    create_audio(samples_continuous, output_file, sample_rate=SAADC_SAMPLE_RATE)
 
 
 def process_wav_to_csv():

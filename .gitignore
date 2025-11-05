@@ -14,3 +14,5 @@ nul
 docs/
 *.wav
 *.csv
+.vscode
+python/test.py
