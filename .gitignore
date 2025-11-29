@@ -16,3 +16,9 @@ docs/
 *.csv
 .vscode
 python/test.py
+python/.pytest_cache
+python/__pycache__
+
+nrf5340_audio/
+
+

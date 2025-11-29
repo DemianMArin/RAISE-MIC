@@ -1,0 +1,3 @@
+[submodule "python/deps/liblc3"]
+	path = python/deps/liblc3
+	url = https://github.com/DemianMArin/liblc3.git

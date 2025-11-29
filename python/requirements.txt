@@ -5,3 +5,4 @@ PyQt5
 pyqtgraph
 qasync
 pydub
+pytest

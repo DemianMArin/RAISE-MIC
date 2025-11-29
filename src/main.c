@@ -23,14 +23,40 @@ LOG_MODULE_REGISTER(NEW_NAME, LOG_LEVEL_DBG);
 #else
 #include <nrfx_ppi.h>
 #endif
+#include <sw_codec_lc3.h>
+
+// LC3 Codec Params
+// 10,000 us / (1/48,000) =  480 samples
+// 480 * 2 bytes (16 bit depth) = 960 bytes
+#define ENC_BUF_SIZE	  120
+#define DEC_BUF_SIZE	  960
+#define PCM_SAMPLE_RATE	  48000
+#define PCM_BIT_DEPTH	  16
+#define LC3_BITRATE	  96000
+#define LC3_FRAME_SIZE_US 10000
+#define LC3_NUM_CHANNELS  1
+#define AUDIO_CH_MONO	  0
+
+static uint8_t audio_encoded[ENC_BUF_SIZE];
+static uint8_t audio_encoded_2[ENC_BUF_SIZE];
+static uint16_t audio_decoded[DEC_BUF_SIZE];
+
+static uint16_t pcm_bytes_req_enc;
+static uint16_t encoded_bytes_written;
+static uint16_t encoded_bytes_written_2;
+
+static uint16_t decoded_bytes_written;
+
 
 // Audio sampling Defines
 // ADC
 #define NRF_SAADC_INPUT_AIN4 NRF_PIN_PORT_TO_PIN_NUMBER(11U, 1)
 #define SAADC_INPUT_PIN NRF_SAADC_INPUT_AIN4
 static nrfx_saadc_channel_t channel = NRFX_SAADC_DEFAULT_CHANNEL_SE(SAADC_INPUT_PIN, 0);
-#define SAADC_SAMPLE_INTERVAL_US 62.5 // 16k Hz sample rate
-#define SAADC_BUFFER_SIZE 2000// 2000 samples = 125msof audio at 16kHz
+#define SAADC_SAMPLE_INTERVAL_US 20.83 // 48kHz samplerate
+//#define SAADC_BUFFER_SIZE 2000// 2000 samples = 250ms of audio at 8kHz, uses 8KB RAM total
+// 480 samples * 2 (windows) = 960
+#define SAADC_BUFFER_SIZE 960
 static int16_t saadc_sample_buffer[2][SAADC_BUFFER_SIZE];
 static uint32_t saadc_current_buffer = 0;
 //Timer
@@ -61,10 +87,6 @@ static uint8_t notify_enabled;
 static struct k_work_delayable spam_work;
 
 static void spam_notify(struct k_work *work);
-
-// ============================================================================
-// Message Queue and Work Thread for Audio Buffer Transmission
-// ============================================================================
 
 // Message structure for passing buffer info from SAADC Interrupt Service Routine (ISR) to work thread
 struct buffer_msg {
@@ -103,6 +125,20 @@ static struct {
 // Forward declaration
 static void ble_send_work_handler(struct k_work *work);
 
+
+// BLE transmission state for LC3 Codec - tracks chunked sending progress
+static struct {
+    int16_t *current_buffer;    // Buffer currently being sent
+    size_t window_frame;        // Number of bytes in LC3_FRAME_SIZE_US
+    bool is_sending;            // True if actively sending a buffer
+} ble_tx_state_lc3codec = {
+    .current_buffer = NULL,
+    .window_frame = DEC_BUF_SIZE,
+    .is_sending = false,
+    .seq_num = 0
+};
+
+
 /* SAADC Event Handler */
 static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
 {
@@ -125,7 +161,7 @@ static void saadc_event_handler(nrfx_saadc_evt_t const *p_event)
             break;
 
         case NRFX_SAADC_EVT_DONE:
-            ble_tx_state.seq_num++; // New sequence of buffer size SAADC_BUFFER_SIZE full =)
+            //ble_tx_state.seq_num++; // New sequence of buffer size SAADC_BUFFER_SIZE full =)
 
             // Buffer has been filled with samples - calculate stats for debugging
             //int64_t average = 0;
@@ -305,9 +341,14 @@ static void notify_cb(struct bt_conn *conn, void *user_data)
     ARG_UNUSED(user_data);
 
     // Previous packet sent successfully, trigger work handler to send next chunk
-    if (ble_tx_state.is_sending) {
+    //if (ble_tx_state.is_sending) {
+    //    k_work_submit(&ble_send_work);
+    //}
+  
+    if (ble_tx_state_lc3codec.is_sending) {
         k_work_submit(&ble_send_work);
     }
+
 }
 
 // Legacy
@@ -491,6 +532,126 @@ static void ble_send_work_handler(struct k_work *work)
     // Otherwise, notify_cb will trigger next chunk when current packet is sent
 }
 
+/* BLE Send Work Handler - sends audio buffer in LC3_FRAME_SIZE_US windows*/
+static void ble_send_work_handler_lc3codec(struct k_work *work)
+{
+    int err;
+
+    // Check if we need to get a new buffer from the queue
+    if (!ble_tx_state_lc3codec.is_sending) {
+        struct buffer_msg msg;
+
+        // Try to get a buffer from the message queue
+        if (k_msgq_get(&buffer_msgq, &msg, K_NO_WAIT) == 0) {
+            // Got a buffer! Start sending it
+            ble_tx_state_lc3codec.current_buffer = msg.buffer;
+            ble_tx_state_lc3codec.is_sending = true;
+            //LOG_INF("Starting to send buffer: %d samples", msg.size);
+        } else {
+            // Queue empty, nothing to send
+            return;
+        }
+    }
+
+    // Check if we can send (connected and notifications enabled)
+    if (!streaming_enabled || !notify_enabled || !current_conn) {
+        LOG_WRN("Cannot send: not ready (streaming=%d, notify=%d, conn=%p)", streaming_enabled, notify_enabled, current_conn);
+        ble_tx_state_lc3codec.is_sending = false;
+        return;
+    }
+
+    // Calculate how many samples to send in this chunk
+    size_t chunk_size = ENC_BUF_SIZE;
+    uint16_t first_input[SAADC_BUFFER_SIZE/2];
+    uint16_t second_input[SAADC_BUFFER_SIZE/2];
+
+    memcpy(&first_input[0]
+               &ble_tx_state.current_buffer[0],
+               SAADC_BUFFER_SIZE * sizeof(int16_t));
+
+    memcpy(&second_input[0]
+               &ble_tx_state.current_buffer[SAADC_BUFFER_SIZE/2],
+               SAADC_BUFFER_SIZE * sizeof(int16_t));
+
+
+    ret = sw_codec_lc3_enc_run(first_input, sizeof(first_input),
+             LC3_USE_BITRATE_FROM_INIT, AUDIO_CH_MONO, sizeof(audio_encoded),
+             audio_encoded, &encoded_bytes_written);
+
+    if (ret) {
+      LOG_WRN("Couldn't lc3 encode first window",
+      return;
+    }
+
+    ret = sw_codec_lc3_enc_run(second_input, sizeof(second_input),
+             LC3_USE_BITRATE_FROM_INIT, AUDIO_CH_MONO, sizeof(audio_encoded_2),
+             audio_encoded_2, &encoded_bytes_written_2);
+
+    if (ret) {
+      LOG_WRN("Couldn't lc3 encode second window",
+      return;
+    }
+
+    //static uint16_t encoded_bytes_written_2;
+    // [encoded_bytes_written_x + 10 ms window] * 2 (windows)
+    // [sizeof(uint16_t) + SAADC_BUFFER_SIZE * sizeof(uint16_t)] * 2
+    uint8_t packet[(sizeof(uint16_t) + (SAADC_BUFFER_SIZE * sizeof(int16_t))) * 2]
+
+
+    //uint8_t packet[PACKET_HEADER_SIZE + chunk_size * 2];
+    size_t len = sizeof(packet);
+
+    // Payload: encoded audio samples
+    memcpy(&packet[0],
+           encoded_bytes_written,
+           sizeof(encoded_bytes_written));
+
+    memcpy(&packet[3],
+           audio_encoded,
+           sizeof(audio_encoded));
+
+    memcpy(&packet[ENC_BUF_SIZE+2],
+           encoded_bytes_written_2,
+           sizeof(encoded_bytes_written_2));
+
+    memcpy(&packet[ENC_BUF_SIZE+3],
+           audio_encoded_2,
+           sizeof(audio_encoded_2));
+
+
+
+    // Send individual values. No UART for debugging =(
+    //uint8_t packet[4];
+    //size_t len = sizeof(packet);
+    //int32_t number = 0xDEADBEEF;
+    //sys_put_le32(number, &packet[0]);
+
+
+    // Send via BLE
+    struct bt_gatt_notify_params params = {
+        .attr = &stream_svc.attrs[3],
+        .data = packet,
+        .len = len,
+        .func = notify_cb,
+        .user_data = NULL,
+    };
+
+
+
+    err = bt_gatt_notify_cb(current_conn, &params);
+    if (err != 0) {
+        if (err == -12) {  // ENOMEM - BLE TX buffers full
+            LOG_WRN("BLE TX buffers full, backing off");
+            // Don't retry immediately - will be triggered by next notify_cb or buffer
+            ble_tx_state.is_sending = false;  // Release current buffer
+        } else {
+            LOG_ERR("bt_gatt_notify_cb failed: %d", err);
+        }
+        return;
+    }
+
+}
+
 static void connected(struct bt_conn *conn, uint8_t err)
 {
     if (!err) {
@@ -550,6 +711,32 @@ static void configure_bluetooth(void)
     LOG_INF("Bluetooth advertising started");
 }
 
+/* LC3 codec config */
+static void configure_lc3_codec(void){
+
+	int ret;
+
+	sw_codec_lc3_init(NULL, NULL, LC3_FRAME_SIZE_US);
+
+  ret = sw_codec_lc3_enc_init(
+      PCM_SAMPLE_RATE,       // 48000 Hz
+      PCM_BIT_DEPTH,         // 16 bits
+      LC3_FRAME_SIZE_US,     // 10000 us
+      LC3_BITRATE,           // 32000 bps
+      LC3_NUM_CHANNELS,      // 1 channel
+      &pcm_bytes_req_enc     // Returns required PCM bytes
+  );
+
+  if (ret != 0) {
+      LOG_ERR("ERROR: sw_codec_lc3_enc_init failed: %d\n", ret);
+      return;
+  }
+
+  LOG_INF("LC3 encoder initialized successfully\n");
+  LOG_INF("PCM bytes required per frame: %d\n", pcm_bytes_req_enc);
+
+}
+
 void main(void)
 {
     LOG_INF("Starting RAISE mic application");
@@ -560,7 +747,12 @@ void main(void)
 
     // Initialize work items
     // k_work_init_delayable(&spam_work, spam_notify);  // Legacy (for testing)
-    k_work_init(&ble_send_work, ble_send_work_handler);  // Audio buffer transmission
+    //k_work_init(&ble_send_work, ble_send_work_handler);  // Audio buffer transmission Raw Data
+    k_work_init(&ble_send_work, ble_send_work_handler_lc3codec);  // Audio buffer transmission LC3 Codec
+
+
+    // Configure LC3 Codec
+    configure_lc3_codec();
 
     // Configure all peripherals
     configure_timer();
