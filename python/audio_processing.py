@@ -268,7 +268,7 @@ def process_wav_to_csv():
 
 
 if __name__ == "__main__":
-    name = "recording"
+    name = "recording_lc3"
 
     if len(sys.argv) < 2:
         print("Usage: python audio_processing.py [all|2csv|2wav]")

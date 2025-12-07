@@ -26,6 +26,8 @@ from qasync import QEventLoop
 import wave
 import os
 from typing import List, Tuple, Optional
+import lc3
+
 
 # Optional MP3 support
 try:
@@ -38,7 +40,7 @@ DEVICE_NAME = "NEW_NAME"
 CTRL_UUID = "12345678-1234-5678-1234-56789abcdef1"
 DATA_UUID = "12345678-1234-5678-1234-56789abcdef2"
 
-AUDIO_FS = 48000 # 16kHz (matches nRF54L15 configuration)
+AUDIO_FS = 48000 # 48kHz (matches nRF54L15 configuration)
 PACKET_HEADER_SIZE = 8
 SAMPLES_PER_PACKET = 118
 SAADC_BUFFER_SIZE = 2000
@@ -47,6 +49,18 @@ SAADC_BUFFER_SIZE = 2000
 VOLTAGE_PLOT_WINDOW = 1000  # Number of samples to display on x-axis
 VOLTAGE_PLOT_Y_MIN = -400# Minimum y-axis value (ADC range: -2048 to 2047)
 VOLTAGE_PLOT_Y_MAX = 400# Maximum y-axis value
+
+#LC3 codec configuration
+# 10,000 us / (1/48,000) =  480 samples
+# 480 * 2 bytes (16 bit depth) = 960 bytes
+ENC_BUF_SIZE = 120
+DEC_BUF_SIZE = 960
+PCM_SAMPLE_RATE = 48000
+PCM_BIT_DEPTH = 16
+LC3_BITRATE = 96000
+LC3_FRAME_SIZE_US = 10000
+LC3_NUM_CHANNELS = 1
+AUDIO_CH_MONO = 0
 
 class RAISEApp(QWidget):
     def __init__(self):
@@ -74,6 +88,13 @@ class RAISEApp(QWidget):
         # Recording segment tracking
         self.record_start_sample_idx: int = 0  # sample index in analog_data where recording began
 
+        # Initialize LC3 decoder
+        self.lc3_decoder = lc3.Decoder(
+            frame_duration_us=LC3_FRAME_SIZE_US,  # 10000 us
+            sample_rate_hz=PCM_SAMPLE_RATE         # 48000 Hz
+        )
+        print(f"LC3 Decoder initialized: {LC3_FRAME_SIZE_US}us @ {PCM_SAMPLE_RATE}Hz")
+
         self.setup_ui()
         self.scan_devices()
 
@@ -92,7 +113,7 @@ class RAISEApp(QWidget):
         layout.addWidget(self.toggle_btn)
 
         self.record_btn = QPushButton("Start Recording")
-        self.record_btn.clicked.connect(self.toggle_recording)
+        self.record_btn.clicked.connect(self.toggle_recording_lc3codec)
         layout.addWidget(self.record_btn)
 
         self.labels = {
@@ -145,7 +166,9 @@ class RAISEApp(QWidget):
         async def run():
             self.client = BleakClient(self.device)
             await self.client.connect()
-            await self.client.start_notify(DATA_UUID, self.handle_notify)
+            # await self.client.start_notify(DATA_UUID, self.handle_notify)
+            await self.client.start_notify(DATA_UUID, self.handle_notify_lc3codec)
+
             self.connected = True
             print("Connected to", self.device.name)
 
@@ -177,6 +200,20 @@ class RAISEApp(QWidget):
             print("Recording: STOP")
             self.save_recording()
 
+    def toggle_recording_lc3codec(self):
+        """LC3 Codec version - no packet metadata tracking"""
+        self.recording = not self.recording
+        if self.recording:
+            # Mark current position as recording start
+            self.record_start_sample_idx = len(self.analog_data)
+            self.record_btn.setText("Stop Recording")
+            print(f"LC3 Recording: START at sample index {self.record_start_sample_idx}")
+        else:
+            # Mark current position as recording end and save
+            self.record_btn.setText("Start Recording")
+            print("LC3 Recording: STOP")
+            self.save_recording_lc3codec()
+
     def update_plots(self):
         if self.analog_data:
             # Old code (fixed 100 samples):
@@ -202,6 +239,63 @@ class RAISEApp(QWidget):
         if self.packet_loss_values:
             self.graph_lines["loss"].setData(self.packet_loss_values[-100:])
             self.labels["loss"].setText(f"Packet Loss: {self.packet_loss_values[-1]:.1f}%")
+
+    def handle_notify_lc3codec(self, handle, data):
+        """
+        LC3 Encoded Packet Format from nRF54L15
+        ==========================================
+        Packet layout (244 bytes total):
+          [0:2]                     = encoded_bytes_written   (uint16_t)
+          [2:2+ENC_BUF_SIZE]        = audio_encoded           (ENC_BUF_SIZE bytes)
+          [2+ENC_BUF_SIZE:4+ENC_BUF_SIZE] = encoded_bytes_written_2 (uint16_t)
+          [4+ENC_BUF_SIZE:244]      = audio_encoded_2         (ENC_BUF_SIZE bytes)
+
+        Each LC3 frame decodes to 480 samples (10ms @ 48kHz)
+        Total decoded output: 960 samples per packet
+        """
+        EXPECTED_PACKET_SIZE = (2 + ENC_BUF_SIZE) * 2
+
+        if len(data) != EXPECTED_PACKET_SIZE:
+            print(f"LC3 packet size error: {len(data)} bytes (expected {EXPECTED_PACKET_SIZE})")
+            return
+
+        # Extract first LC3 frame
+        encoded_bytes_1 = int.from_bytes(data[0:2], byteorder='little', signed=False)
+        audio_encoded_1 = data[2:2+ENC_BUF_SIZE]
+
+        # Extract second LC3 frame
+        frame2_offset = 2 + ENC_BUF_SIZE
+        encoded_bytes_2 = int.from_bytes(data[frame2_offset:frame2_offset+2], byteorder='little', signed=False)
+        audio_encoded_2 = data[frame2_offset+2:frame2_offset+2+ENC_BUF_SIZE]
+
+        # Validate encoded sizes match expected
+        if encoded_bytes_1 != ENC_BUF_SIZE:
+            print(f"Frame 1 size mismatch: {encoded_bytes_1} bytes (expected {ENC_BUF_SIZE})")
+            return
+        if encoded_bytes_2 != ENC_BUF_SIZE:
+            print(f"Frame 2 size mismatch: {encoded_bytes_2} bytes (expected {ENC_BUF_SIZE})")
+            return
+
+        # Decode both LC3 frames (returns raw bytes)
+        try:
+            decoded_bytes_1 = self.lc3_decoder.decode(audio_encoded_1, bit_depth=PCM_BIT_DEPTH)
+            decoded_bytes_2 = self.lc3_decoder.decode(audio_encoded_2, bit_depth=PCM_BIT_DEPTH)
+        except Exception as e:
+            print(f"LC3 decode failed: {e}")
+            return
+
+        if len(decoded_bytes_1) != DEC_BUF_SIZE or len(decoded_bytes_2) != DEC_BUF_SIZE:
+            print(f"Unexpected decoded size: frame1={len(decoded_bytes_1)}, frame2={len(decoded_bytes_2)}")
+            return
+
+        # Convert raw bytes to int16 PCM samples
+        decoded_frame_1 = np.frombuffer(decoded_bytes_1, dtype=np.int16)
+        decoded_frame_2 = np.frombuffer(decoded_bytes_2, dtype=np.int16)
+
+        # Combine both frames and add to buffers
+        all_samples = list(decoded_frame_1) + list(decoded_frame_2)
+        self.analog_data.extend(all_samples)
+        self.audio_buffer.extend(all_samples)
 
     def handle_notify(self, handle, data): 
         """
@@ -363,6 +457,33 @@ class RAISEApp(QWidget):
         except Exception as e:
             print("MP3 export skipped:", e)
             return False
+
+    def save_recording_lc3codec(self):
+        """Save LC3-decoded audio recording"""
+        start_sample = self.record_start_sample_idx
+        end_sample = len(self.analog_data)
+
+        if end_sample <= start_sample:
+            print("Nothing to save.")
+            return
+
+        # Extract recorded segment
+        recorded_samples = self.analog_data[start_sample:end_sample]
+        num_samples = len(recorded_samples)
+
+        print(f"Saving {num_samples} samples ({num_samples/PCM_SAMPLE_RATE:.2f} seconds @ {PCM_SAMPLE_RATE}Hz)...")
+
+        base = "recording_lc3"
+
+        # 1) Save CSV with simple index
+        csv_name = f"{base}.csv"
+        with open(csv_name, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["sample_index", "sample"])
+            for i, sample in enumerate(recorded_samples):
+                writer.writerow([i, sample])
+        print(f"Saved: {csv_name} ({num_samples} samples)")
+
 
     def save_recording(self):
         # Determine sample range to save (only the current recording window)
